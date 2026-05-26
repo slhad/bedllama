@@ -230,30 +230,50 @@ const LONG_CONTEXT_MODELS: Record<string, string> = {
 };
 
 function deriveModelNameFromProfileId(profileId: string): string {
-  // eu.anthropic.claude-sonnet-4-6  →  claude-sonnet-4-6
-  // eu.anthropic.claude-haiku-4-5-20251001-v1:0  →  claude-haiku-4-5
-  const withoutPrefix = profileId.replace(/^(?:eu|us|global)\.anthropic\./, "");
+  // eu.anthropic.claude-sonnet-4-6        →  claude-sonnet-4-6
+  // eu.meta.llama3-2-1b-instruct-v1:0     →  llama3-2-1b-instruct
+  // eu.amazon.nova-pro-v1:0               →  nova-pro
+  // eu.mistral.pixtral-large-2502-v1:0    →  pixtral-large
+  const withoutPrefix = profileId.replace(/^(?:eu|us|global)\.[^.]+\./, "");
   // Strip trailing version suffix like -20251001-v1:0 or -v1:0 or -v1
   return withoutPrefix.replace(/-\d{8}-v\d+(?::\d+)?$/, "").replace(/-v\d+(?::\d+)?$/, "");
 }
 
-function deriveParamSize(modelName: string): string {
-  // claude-sonnet-4-6  →  4.6-sonnet
-  const m = modelName.match(/^claude-([a-z]+)-(\d+)-(\d+)/);
-  if (m) {
-    return `${m[2]}.${m[3]}-${m[1]}`;
+function deriveProviderFromProfileId(profileId: string): string {
+  // eu.anthropic.claude-sonnet-4-6  →  anthropic
+  const m = profileId.match(/^(?:eu|us|global)\.([^.]+)\./);
+  return m ? m[1]! : "unknown";
+}
+
+function deriveFamilyFromModelName(modelName: string, provider: string): string {
+  if (provider === "anthropic") return "claude";
+  if (provider === "amazon") return "nova";
+  if (provider === "meta") return "llama";
+  if (provider === "mistral") return "mistral";
+  if (provider === "cohere") return "cohere";
+  return modelName.split("-")[0] ?? provider;
+}
+
+function deriveParamSize(modelName: string, provider: string): string {
+  if (provider === "anthropic") {
+    // claude-sonnet-4-6  →  4.6-sonnet
+    const m = modelName.match(/^claude-([a-z]+)-(\d+)-(\d+)/);
+    if (m) return `${m[2]}.${m[3]}-${m[1]}`;
+    return modelName.replace(/^claude-/, "");
   }
-  return modelName.replace(/^claude-/, "");
+  return modelName;
 }
 
 function buildModelSpecFromProfile(profileId: string): ModelSpec {
   const modelName = deriveModelNameFromProfileId(profileId);
+  const provider = deriveProviderFromProfileId(profileId);
+  const family = deriveFamilyFromModelName(modelName, provider);
   return {
     upstreamModel: modelName,
     shimModel: `${modelName}:latest`,
     basename: modelName,
-    family: "claude",
-    parameterSize: deriveParamSize(modelName),
+    family,
+    parameterSize: deriveParamSize(modelName, provider),
     contextLength: 200000,
     capabilities: ["tools", "vision"],
     size: 3338801804,
@@ -265,7 +285,7 @@ function fetchBedrockInferenceProfiles(): string[] {
     "bedrock", "list-inference-profiles",
     "--profile", config.awsProfile,
     "--region", config.awsRegion,
-    "--query", "inferenceProfileSummaries[?starts_with(inferenceProfileId, 'eu.')].inferenceProfileId",
+    "--query", "inferenceProfileSummaries[*].inferenceProfileId",
     "--output", "json",
   ]);
   if (result.status !== 0) {
@@ -273,8 +293,7 @@ function fetchBedrockInferenceProfiles(): string[] {
     return [];
   }
   try {
-    const ids = JSON.parse(result.stdout.trim()) as string[];
-    return ids.filter((id) => id.includes("anthropic"));
+    return JSON.parse(result.stdout.trim()) as string[];
   } catch {
     return [];
   }
@@ -292,6 +311,8 @@ function buildDynamicModels(profileIds: string[]): { modelSpecs: ModelSpec[]; li
     }
     seen.add(modelName);
 
+    const provider = deriveProviderFromProfileId(profileId);
+    const family = deriveFamilyFromModelName(modelName, provider);
     modelSpecs.push(buildModelSpecFromProfile(profileId));
     litellmModelMap.push({
       modelName,
@@ -305,8 +326,8 @@ function buildDynamicModels(profileIds: string[]): { modelSpecs: ModelSpec[]; li
         upstreamModel: modelName,
         shimModel: `${longContextBasename}:latest`,
         basename: longContextBasename,
-        family: "claude",
-        parameterSize: `${deriveParamSize(modelName)}-1m`,
+        family,
+        parameterSize: `${deriveParamSize(modelName, provider)}-1m`,
         contextLength: 1000000,
         capabilities: ["tools", "vision"],
         size: 3338801804,
@@ -858,14 +879,18 @@ async function startStack(): Promise<void> {
 
   // Discover available models from AWS Bedrock inference profiles.
   process.stdout.write("Fetching available Bedrock inference profiles...\n");
+  const allProfileIds = fetchBedrockInferenceProfiles();
+
+  // If config.models is set, use it as a filter on the fetched profiles.
+  // Entries can be shim names ("claude-sonnet-4-6:latest") or bare model names.
   const profileIds = config.models.length > 0
-    ? config.models.map((m) => {
-        // config.models contains shim names like "claude-sonnet-4-6:latest";
-        // convert back to a profile ID for the LiteLLM config.
-        const basename = m.endsWith(":latest") ? m.slice(0, -7) : m;
-        return `eu.anthropic.${basename}`;
-      })
-    : fetchBedrockInferenceProfiles();
+    ? (() => {
+        const allowed = new Set(
+          config.models.map((m) => (m.endsWith(":latest") ? m.slice(0, -7) : m))
+        );
+        return allProfileIds.filter((id) => allowed.has(deriveModelNameFromProfileId(id)));
+      })()
+    : allProfileIds;
 
   if (profileIds.length === 0) {
     fail("No Bedrock inference profiles found. Check your AWS credentials and region.");
