@@ -1,0 +1,37 @@
+{
+  "name": "bedllama",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Consolidated Bedrock -> LiteLLM -> Ollama compatibility stack manager",
+  "bin": {
+    "bedllama": "./dist/bedllama.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "npm run typecheck",
+    "prestart": "npm run build",
+    "start": "node dist/bedllama.js start",
+    "stop": "node dist/bedllama.js stop",
+    "restart": "node dist/bedllama.js restart",
+    "status": "node dist/bedllama.js status",
+    "logs": "node dist/bedllama.js logs all",
+    "logs:follow": "node dist/bedllama.js logs all -f",
+    "logs:litellm": "node dist/bedllama.js logs litellm",
+    "logs:litellm:follow": "node dist/bedllama.js logs litellm -f",
+    "logs:server": "node dist/bedllama.js logs server",
+    "logs:server:follow": "node dist/bedllama.js logs server -f",
+    "logs:front": "node dist/bedllama.js logs front",
+    "logs:front:follow": "node dist/bedllama.js logs front -f",
+    "logs:ollama": "node dist/bedllama.js logs ollama",
+    "logs:ollama:follow": "node dist/bedllama.js logs ollama -f",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
