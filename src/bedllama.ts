@@ -229,6 +229,17 @@ const LONG_CONTEXT_MODELS: Record<string, string> = {
   "claude-opus-4-7": "claude-opus-4-7-1m",
 };
 
+// Model name fragments that are known NOT to support tool use via the Bedrock
+// Converse API, even though they output TEXT and support streaming.
+// Everything else is assumed to support tools.
+const NO_TOOLS_MODELS = [
+  "mistral-7b",
+  "mixtral-8x7b",
+  "llama3-2-1b",
+  "llama3-2-3b",
+  "pegasus",
+];
+
 function deriveModelNameFromProfileId(profileId: string): string {
   // eu.anthropic.claude-sonnet-4-6        →  claude-sonnet-4-6
   // eu.meta.llama3-2-1b-instruct-v1:0     →  llama3-2-1b-instruct
@@ -254,6 +265,24 @@ function deriveFamilyFromModelName(modelName: string, provider: string): string 
   return modelName.split("-")[0] ?? provider;
 }
 
+function deriveCapabilitiesFromMap(
+  profileId: string,
+  capabilityMap: Map<string, FoundationModelCapabilities>
+): string[] {
+  const baseId = profileId.replace(/^(?:eu|us|global)\./, "");
+  const caps = capabilityMap.get(baseId);
+  if (!caps) {
+    // Unknown model — fall back to NO_TOOLS_MODELS denylist + no vision assumption.
+    const modelName = deriveModelNameFromProfileId(profileId);
+    const tools = !NO_TOOLS_MODELS.some((f) => modelName.includes(f));
+    return tools ? ["tools"] : [];
+  }
+  const result: string[] = [];
+  if (caps.tools) result.push("tools");
+  if (caps.vision) result.push("vision");
+  return result;
+}
+
 function deriveParamSize(modelName: string, provider: string): string {
   if (provider === "anthropic") {
     // claude-sonnet-4-6  →  4.6-sonnet
@@ -264,7 +293,10 @@ function deriveParamSize(modelName: string, provider: string): string {
   return modelName;
 }
 
-function buildModelSpecFromProfile(profileId: string): ModelSpec {
+function buildModelSpecFromProfile(
+  profileId: string,
+  capabilityMap: Map<string, FoundationModelCapabilities>
+): ModelSpec {
   const modelName = deriveModelNameFromProfileId(profileId);
   const provider = deriveProviderFromProfileId(profileId);
   const family = deriveFamilyFromModelName(modelName, provider);
@@ -275,34 +307,53 @@ function buildModelSpecFromProfile(profileId: string): ModelSpec {
     family,
     parameterSize: deriveParamSize(modelName, provider),
     contextLength: 200000,
-    capabilities: ["tools", "vision"],
+    capabilities: deriveCapabilitiesFromMap(profileId, capabilityMap),
     size: 3338801804,
   };
 }
 
-function fetchEmbeddingModelIds(): Set<string> {
-  // Returns the set of base model IDs whose outputModalities include only EMBEDDING.
+interface FoundationModelCapabilities {
+  vision: boolean;
+  tools: boolean;
+}
+
+function fetchFoundationModelCapabilities(): Map<string, FoundationModelCapabilities> {
+  // Fetches inputModalities and outputModalities for all foundation models.
+  // Returns a map keyed by base model ID (without region prefix).
+  // vision = inputModalities includes IMAGE
+  // tools  = outputModalities includes TEXT (streaming) AND not in NO_TOOLS_MODELS denylist
   const result = run("aws", [
     "bedrock", "list-foundation-models",
     "--profile", config.awsProfile,
     "--region", config.awsRegion,
-    "--query", "modelSummaries[?contains(outputModalities, 'EMBEDDING')].modelId",
+    "--query", "modelSummaries[*].{id:modelId,in:inputModalities,out:outputModalities}",
     "--output", "json",
   ]);
+  const map = new Map<string, FoundationModelCapabilities>();
   if (result.status !== 0) {
-    return new Set();
+    return map;
   }
   try {
-    const ids = JSON.parse(result.stdout.trim()) as string[];
-    return new Set(ids);
+    const entries = JSON.parse(result.stdout.trim()) as Array<{
+      id: string;
+      in: string[];
+      out: string[];
+    }>;
+    for (const entry of entries) {
+      const vision = Array.isArray(entry.in) && entry.in.includes("IMAGE");
+      const isTextOutput = Array.isArray(entry.out) && entry.out.includes("TEXT");
+      const tools = isTextOutput && !NO_TOOLS_MODELS.some((f) => entry.id.includes(f));
+      map.set(entry.id, { vision, tools });
+    }
   } catch {
-    return new Set();
+    // ignore parse errors — callers fall back gracefully
   }
+  return map;
 }
 
-function fetchBedrockInferenceProfiles(): string[] {
-  const embeddingIds = fetchEmbeddingModelIds();
-
+function fetchBedrockInferenceProfiles(
+  capabilityMap: Map<string, FoundationModelCapabilities>
+): string[] {
   const result = run("aws", [
     "bedrock", "list-inference-profiles",
     "--profile", config.awsProfile,
@@ -316,18 +367,24 @@ function fetchBedrockInferenceProfiles(): string[] {
   }
   try {
     const ids = JSON.parse(result.stdout.trim()) as string[];
-    // Filter out embedding models by cross-referencing with foundation model output modalities.
+    // Filter out embedding models using the capability map.
     // Profile IDs like eu.cohere.embed-v4:0 map to base model cohere.embed-v4:0.
     return ids.filter((id) => {
       const baseId = id.replace(/^(?:eu|us|global)\./, "");
-      return !embeddingIds.has(baseId);
+      const caps = capabilityMap.get(baseId);
+      // If not in the map, keep it (unknown model — let LiteLLM handle it).
+      // If in the map, keep only if it has TEXT output (i.e. not embedding-only).
+      return !caps || caps.tools || caps.vision;
     });
   } catch {
     return [];
   }
 }
 
-function buildDynamicModels(profileIds: string[]): { modelSpecs: ModelSpec[]; litellmModelMap: LitellmModel[] } {
+function buildDynamicModels(
+  profileIds: string[],
+  capabilityMap: Map<string, FoundationModelCapabilities>
+): { modelSpecs: ModelSpec[]; litellmModelMap: LitellmModel[] } {
   const seen = new Set<string>();
   const modelSpecs: ModelSpec[] = [];
   const litellmModelMap: LitellmModel[] = [];
@@ -341,7 +398,8 @@ function buildDynamicModels(profileIds: string[]): { modelSpecs: ModelSpec[]; li
 
     const provider = deriveProviderFromProfileId(profileId);
     const family = deriveFamilyFromModelName(modelName, provider);
-    modelSpecs.push(buildModelSpecFromProfile(profileId));
+    const capabilities = deriveCapabilitiesFromMap(profileId, capabilityMap);
+    modelSpecs.push(buildModelSpecFromProfile(profileId, capabilityMap));
     litellmModelMap.push({
       modelName,
       bedrockModel: `bedrock/${profileId}`,
@@ -357,7 +415,7 @@ function buildDynamicModels(profileIds: string[]): { modelSpecs: ModelSpec[]; li
         family,
         parameterSize: `${deriveParamSize(modelName, provider)}-1m`,
         contextLength: 1000000,
-        capabilities: ["tools", "vision"],
+        capabilities,
         size: 3338801804,
       });
     }
@@ -757,7 +815,7 @@ function serverArgs(): string[] {
   return [__filename, "serve"];
 }
 
-function serverEnv(): NodeJS.ProcessEnv {
+function serverEnv(modelSpecs: ModelSpec[]): NodeJS.ProcessEnv {
   return {
     ...process.env,
     BEDLLAMA_STATE_DIR: config.stateDir,
@@ -771,6 +829,7 @@ function serverEnv(): NodeJS.ProcessEnv {
     BEDLLAMA_OLLAMA_DEFAULT_MODEL: config.ollamaDefaultModel,
     BEDLLAMA_MODELS: config.models.join(","),
     BEDLLAMA_LOG: config.enableServerLog ? "1" : "0",
+    BEDLLAMA_MODEL_SPECS: JSON.stringify(modelSpecs),
   };
 }
 
@@ -906,8 +965,11 @@ async function startStack(): Promise<void> {
   stopStack({ quiet: true });
 
   // Discover available models from AWS Bedrock inference profiles.
+  process.stdout.write("Fetching available Bedrock model capabilities...\n");
+  const capabilityMap = fetchFoundationModelCapabilities();
+
   process.stdout.write("Fetching available Bedrock inference profiles...\n");
-  const allProfileIds = fetchBedrockInferenceProfiles();
+  const allProfileIds = fetchBedrockInferenceProfiles(capabilityMap);
 
   // If config.models is set, use it as a filter on the fetched profiles.
   // Entries can be shim names ("claude-sonnet-4-6:latest") or bare model names.
@@ -924,7 +986,7 @@ async function startStack(): Promise<void> {
     fail("No Bedrock inference profiles found. Check your AWS credentials and region.");
   }
 
-  const { modelSpecs, litellmModelMap } = buildDynamicModels(profileIds);
+  const { modelSpecs, litellmModelMap } = buildDynamicModels(profileIds, capabilityMap);
   dynamicModelSpecs = modelSpecs;
   dynamicLitellmModelMap = litellmModelMap;
 
@@ -963,7 +1025,7 @@ async function startStack(): Promise<void> {
     fail(String(error));
   }
 
-  startDetachedProcess(config.processNames.server, process.execPath, serverArgs(), serverEnv());
+  startDetachedProcess(config.processNames.server, process.execPath, serverArgs(), serverEnv(dynamicModelSpecs));
   await waitForHttp(`http://${config.hosts.front}:${config.ports.front}/health`);
   await waitForHttp(`http://${config.hosts.ollama}:${config.ports.ollama}/api/version`);
 
@@ -1212,7 +1274,7 @@ function makeFallbackSpec(model: string): ModelSpec {
     family: "claude",
     parameterSize: basename.replace(/^claude-/, ""),
     contextLength: 200000,
-    capabilities: ["tools", "vision"],
+    capabilities: NO_TOOLS_MODELS.some((f) => basename.includes(f)) ? [] : ["tools", "vision"],
     size: 3338801804,
   };
 }
@@ -1234,6 +1296,17 @@ function getModelSpec(model: string | undefined): ModelSpec {
 function sanitizeSamplingParams(payload: JsonMap, spec?: ModelSpec): JsonMap {
   if (!payload || typeof payload !== "object") {
     return payload;
+  }
+
+  // Strip image content parts from messages when the model doesn't support vision.
+  if (spec && !spec.capabilities.includes("vision") && Array.isArray(payload.messages)) {
+    payload.messages = (payload.messages as JsonMap[]).map((msg) => {
+      if (!Array.isArray(msg.content)) return msg;
+      const textOnly = (msg.content as JsonMap[]).filter(
+        (part) => part.type !== "image_url" && part.type !== "image"
+      );
+      return { ...msg, content: textOnly };
+    });
   }
 
   if (payload.options && typeof payload.options === "object") {
@@ -1550,7 +1623,7 @@ async function handleApiChat(req: IncomingMessage, res: NodeResponse): Promise<v
       model: spec.upstreamModel,
       messages: Array.isArray(body.messages) ? body.messages : [],
       stream,
-      tools: body.tools,
+      tools: spec.capabilities.includes("tools") ? body.tools : undefined,
       options: body.options,
       format: body.format,
       keep_alive: body.keep_alive,
@@ -1674,6 +1747,10 @@ async function proxyV1Request(req: IncomingMessage, res: NodeResponse, url: URL)
           const spec = getModelSpec((parsed.model as string | undefined) || getDefaultSpec().shimModel);
           model = spec.shimModel;
           parsed.model = spec.upstreamModel;
+          if (!spec.capabilities.includes("tools")) {
+            delete parsed.tools;
+            delete parsed.tool_choice;
+          }
           sanitizeSamplingParams(parsed, spec);
           body = JSON.stringify(parsed);
           headers.set("content-length", Buffer.byteLength(body).toString());
@@ -1769,6 +1846,16 @@ async function handleOllamaRequest(req: IncomingMessage, res: NodeResponse): Pro
 }
 
 function startIntegratedServer(): void {
+  // Load model specs passed from the parent `start` process.
+  const specsEnv = process.env.BEDLLAMA_MODEL_SPECS;
+  if (specsEnv) {
+    try {
+      dynamicModelSpecs = JSON.parse(specsEnv) as ModelSpec[];
+    } catch {
+      serverLog("warning: failed to parse BEDLLAMA_MODEL_SPECS");
+    }
+  }
+
   const frontServer = http.createServer((req, res) => {
     void handleFrontRequest(req, res).catch((error) => {
       sendJson(res, 502, { error: String(error) });
