@@ -214,168 +214,130 @@ const config = {
   postgresPort: envNumber("BEDLLAMA_POSTGRES_PORT", userConfig.postgresPort ?? 5432),
   postgresPassword: env("BEDLLAMA_POSTGRES_PASSWORD", userConfig.postgresPassword ?? "bedllama"),
   postgresContainerName: env("BEDLLAMA_POSTGRES_CONTAINER", "bedllama-postgres"),
-  models: envList("BEDLLAMA_MODELS", userConfig.models ? userConfig.models.split(",").map((m) => m.trim()).filter(Boolean) : [
-    "claude-haiku-4-5:latest",
-    "claude-sonnet-4-5:latest",
-    "claude-sonnet-4-6:latest",
-    "claude-sonnet-4-6-1m:latest",
-    "claude-opus-4-5:latest",
-    "claude-opus-4-6:latest",
-    "claude-opus-4-6-1m:latest",
-    "claude-opus-4-7:latest",
-    "claude-opus-4-7-1m:latest",
-  ]),
+  models: envList("BEDLLAMA_MODELS", userConfig.models ? userConfig.models.split(",").map((m) => m.trim()).filter(Boolean) : []),
 };
 
-const modelSpecs: ModelSpec[] = [
-  {
-    upstreamModel: "claude-haiku-4-5",
-    shimModel: "claude-haiku-4-5:latest",
-    basename: "claude-haiku-4-5",
+// ---------------------------------------------------------------------------
+// Dynamic model discovery from AWS Bedrock inference profiles
+// ---------------------------------------------------------------------------
+
+// Models that expose a 1M-context variant via a separate shim name.
+// Key: upstream model name, value: shim suffix for the 1M variant.
+const LONG_CONTEXT_MODELS: Record<string, string> = {
+  "claude-sonnet-4-6": "claude-sonnet-4-6-1m",
+  "claude-opus-4-6": "claude-opus-4-6-1m",
+  "claude-opus-4-7": "claude-opus-4-7-1m",
+};
+
+function deriveModelNameFromProfileId(profileId: string): string {
+  // eu.anthropic.claude-sonnet-4-6  →  claude-sonnet-4-6
+  // eu.anthropic.claude-haiku-4-5-20251001-v1:0  →  claude-haiku-4-5
+  const withoutPrefix = profileId.replace(/^(?:eu|us|global)\.anthropic\./, "");
+  // Strip trailing version suffix like -20251001-v1:0 or -v1:0 or -v1
+  return withoutPrefix.replace(/-\d{8}-v\d+(?::\d+)?$/, "").replace(/-v\d+(?::\d+)?$/, "");
+}
+
+function deriveParamSize(modelName: string): string {
+  // claude-sonnet-4-6  →  4.6-sonnet
+  const m = modelName.match(/^claude-([a-z]+)-(\d+)-(\d+)/);
+  if (m) {
+    return `${m[2]}.${m[3]}-${m[1]}`;
+  }
+  return modelName.replace(/^claude-/, "");
+}
+
+function buildModelSpecFromProfile(profileId: string): ModelSpec {
+  const modelName = deriveModelNameFromProfileId(profileId);
+  return {
+    upstreamModel: modelName,
+    shimModel: `${modelName}:latest`,
+    basename: modelName,
     family: "claude",
-    parameterSize: "4.5-haiku",
-    contextLength: 200000,
-    capabilities: ["tools", "vision"],
-    size: 1800000000,
-  },
-  {
-    upstreamModel: "claude-sonnet-4-5",
-    shimModel: "claude-sonnet-4-5:latest",
-    basename: "claude-sonnet-4-5",
-    family: "claude",
-    parameterSize: "4.5-sonnet",
-    contextLength: 200000,
-    capabilities: ["tools", "vision"],
-    size: 2800000000,
-  },
-  {
-    upstreamModel: "claude-sonnet-4-6",
-    shimModel: "claude-sonnet-4-6:latest",
-    basename: "claude-sonnet-4-6",
-    family: "claude",
-    parameterSize: "4.6-sonnet",
+    parameterSize: deriveParamSize(modelName),
     contextLength: 200000,
     capabilities: ["tools", "vision"],
     size: 3338801804,
-  },
-  {
-    upstreamModel: "claude-sonnet-4-6",
-    shimModel: "claude-sonnet-4-6-1m:latest",
-    basename: "claude-sonnet-4-6-1m",
-    family: "claude",
-    parameterSize: "4.6-sonnet-1m",
-    contextLength: 1000000,
-    capabilities: ["tools", "vision"],
-    size: 3338801804,
-  },
-  {
-    upstreamModel: "claude-opus-4-5",
-    shimModel: "claude-opus-4-5:latest",
-    basename: "claude-opus-4-5",
-    family: "claude",
-    parameterSize: "4.5-opus",
-    contextLength: 200000,
-    capabilities: ["tools", "vision"],
-    size: 5200000000,
-  },
-  {
-    upstreamModel: "claude-opus-4-6",
-    shimModel: "claude-opus-4-6:latest",
-    basename: "claude-opus-4-6",
-    family: "claude",
-    parameterSize: "4.6-opus",
-    contextLength: 200000,
-    capabilities: ["tools", "vision"],
-    size: 6200000000,
-  },
-  {
-    upstreamModel: "claude-opus-4-6",
-    shimModel: "claude-opus-4-6-1m:latest",
-    basename: "claude-opus-4-6-1m",
-    family: "claude",
-    parameterSize: "4.6-opus-1m",
-    contextLength: 1000000,
-    capabilities: ["tools", "vision"],
-    size: 6200000000,
-  },
-  {
-    upstreamModel: "claude-opus-4-7",
-    shimModel: "claude-opus-4-7:latest",
-    basename: "claude-opus-4-7",
-    family: "claude",
-    parameterSize: "4.7-opus",
-    contextLength: 200000,
-    capabilities: ["tools", "vision"],
-    size: 6400000000,
-  },
-  {
-    upstreamModel: "claude-opus-4-7",
-    shimModel: "claude-opus-4-7-1m:latest",
-    basename: "claude-opus-4-7-1m",
-    family: "claude",
-    parameterSize: "4.7-opus-1m",
-    contextLength: 1000000,
-    capabilities: ["tools", "vision"],
-    size: 6400000000,
-  },
-];
+  };
+}
 
-const litellmModelMap: LitellmModel[] = [
-  {
-    modelName: "claude-haiku-4-5",
-    bedrockModel: env(
-      "BEDLLAMA_BEDROCK_MODEL_CLAUDE_HAIKU_4_5",
-      "bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0"
-    ),
-  },
-  {
-    modelName: "claude-sonnet-4-5",
-    bedrockModel: env(
-      "BEDLLAMA_BEDROCK_MODEL_CLAUDE_SONNET_4_5",
-      "bedrock/eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
-    ),
-  },
-  {
-    modelName: "claude-sonnet-4-6",
-    bedrockModel: env(
-      "BEDLLAMA_BEDROCK_MODEL_CLAUDE_SONNET_4_6",
-      "bedrock/eu.anthropic.claude-sonnet-4-6"
-    ),
-  },
-  {
-    modelName: "claude-opus-4-5",
-    bedrockModel: env(
-      "BEDLLAMA_BEDROCK_MODEL_CLAUDE_OPUS_4_5",
-      "bedrock/eu.anthropic.claude-opus-4-5-20251101-v1:0"
-    ),
-  },
-  {
-    modelName: "claude-opus-4-6",
-    bedrockModel: env(
-      "BEDLLAMA_BEDROCK_MODEL_CLAUDE_OPUS_4_6",
-      "bedrock/eu.anthropic.claude-opus-4-6-v1"
-    ),
-  },
-  {
-    modelName: "claude-opus-4-7",
-    bedrockModel: env(
-      "BEDLLAMA_BEDROCK_MODEL_CLAUDE_OPUS_4_7",
-      "bedrock/eu.anthropic.claude-opus-4-7"
-    ),
-  },
-];
+function fetchBedrockInferenceProfiles(): string[] {
+  const result = run("aws", [
+    "bedrock", "list-inference-profiles",
+    "--profile", config.awsProfile,
+    "--region", config.awsRegion,
+    "--query", "inferenceProfileSummaries[?starts_with(inferenceProfileId, 'eu.')].inferenceProfileId",
+    "--output", "json",
+  ]);
+  if (result.status !== 0) {
+    process.stderr.write(`Warning: could not list Bedrock inference profiles: ${(result.stderr || result.stdout || "").trim()}\n`);
+    return [];
+  }
+  try {
+    const ids = JSON.parse(result.stdout.trim()) as string[];
+    return ids.filter((id) => id.includes("anthropic"));
+  } catch {
+    return [];
+  }
+}
 
-const modelByUpstream = new Map<string, ModelSpec>(
-  modelSpecs.map((spec) => [spec.upstreamModel, spec])
-);
-const modelByShim = new Map<string, ModelSpec>(modelSpecs.map((spec) => [spec.shimModel, spec]));
-const modelByBasename = new Map<string, ModelSpec>(
-  modelSpecs.map((spec) => [spec.basename, spec])
-);
-const defaultSpec =
-  modelByUpstream.get(config.ollamaDefaultModel) ??
-  modelByBasename.get(config.ollamaDefaultModel) ??
-  modelSpecs[0]!;
+function buildDynamicModels(profileIds: string[]): { modelSpecs: ModelSpec[]; litellmModelMap: LitellmModel[] } {
+  const seen = new Set<string>();
+  const modelSpecs: ModelSpec[] = [];
+  const litellmModelMap: LitellmModel[] = [];
+
+  for (const profileId of profileIds) {
+    const modelName = deriveModelNameFromProfileId(profileId);
+    if (seen.has(modelName)) {
+      continue;
+    }
+    seen.add(modelName);
+
+    modelSpecs.push(buildModelSpecFromProfile(profileId));
+    litellmModelMap.push({
+      modelName,
+      bedrockModel: `bedrock/${profileId}`,
+    });
+
+    // Add a 1M-context shim variant if this model supports it.
+    const longContextBasename = LONG_CONTEXT_MODELS[modelName];
+    if (longContextBasename) {
+      modelSpecs.push({
+        upstreamModel: modelName,
+        shimModel: `${longContextBasename}:latest`,
+        basename: longContextBasename,
+        family: "claude",
+        parameterSize: `${deriveParamSize(modelName)}-1m`,
+        contextLength: 1000000,
+        capabilities: ["tools", "vision"],
+        size: 3338801804,
+      });
+    }
+  }
+
+  return { modelSpecs, litellmModelMap };
+}
+
+// Populated at startup by startStack(); used by the serve path via makeFallbackSpec.
+let dynamicModelSpecs: ModelSpec[] = [];
+let dynamicLitellmModelMap: LitellmModel[] = [];
+
+function getModelSpecs(): ModelSpec[] {
+  return dynamicModelSpecs;
+}
+
+function getLitellmModelMap(): LitellmModel[] {
+  return dynamicLitellmModelMap;
+}
+
+function getDefaultSpec(): ModelSpec {
+  const specs = dynamicModelSpecs;
+  return (
+    specs.find((s) => s.upstreamModel === config.ollamaDefaultModel) ??
+    specs.find((s) => s.basename === config.ollamaDefaultModel) ??
+    specs[0] ??
+    makeFallbackSpec(config.ollamaDefaultModel)
+  );
+}
 
 function fail(message: string, code = 1): never {
   process.stderr.write(`${message}\n`);
@@ -848,7 +810,7 @@ function stopPostgres(): void {
 
 function generateLitellmConfig(): string {
   const lines: string[] = ["model_list:"];
-  for (const model of litellmModelMap) {
+  for (const model of getLitellmModelMap()) {
     lines.push(`  - model_name: ${yamlScalar(model.modelName)}`);
     lines.push("    litellm_params:");
     lines.push(`      model: ${yamlScalar(model.bedrockModel)}`);
@@ -893,6 +855,25 @@ function processStatus(name: string): ProcessState {
 async function startStack(): Promise<void> {
   requireDependencies();
   stopStack({ quiet: true });
+
+  // Discover available models from AWS Bedrock inference profiles.
+  process.stdout.write("Fetching available Bedrock inference profiles...\n");
+  const profileIds = config.models.length > 0
+    ? config.models.map((m) => {
+        // config.models contains shim names like "claude-sonnet-4-6:latest";
+        // convert back to a profile ID for the LiteLLM config.
+        const basename = m.endsWith(":latest") ? m.slice(0, -7) : m;
+        return `eu.anthropic.${basename}`;
+      })
+    : fetchBedrockInferenceProfiles();
+
+  if (profileIds.length === 0) {
+    fail("No Bedrock inference profiles found. Check your AWS credentials and region.");
+  }
+
+  const { modelSpecs, litellmModelMap } = buildDynamicModels(profileIds);
+  dynamicModelSpecs = modelSpecs;
+  dynamicLitellmModelMap = litellmModelMap;
 
   if (config.adminUi) {
     startPostgres();
@@ -944,8 +925,8 @@ async function startStack(): Promise<void> {
     );
   }
   process.stdout.write("Models:\n");
-  for (const model of config.models) {
-    process.stdout.write(`  - ${model}\n`);
+  for (const spec of dynamicModelSpecs) {
+    process.stdout.write(`  - ${spec.shimModel}\n`);
   }
 }
 
@@ -1185,13 +1166,14 @@ function makeFallbackSpec(model: string): ModelSpec {
 
 function getModelSpec(model: string | undefined): ModelSpec {
   if (!model) {
-    return defaultSpec;
+    return getDefaultSpec();
   }
   const basename = model.endsWith(":latest") ? model.slice(0, -7) : model;
+  const specs = getModelSpecs();
   return (
-    modelByShim.get(model) ??
-    modelByUpstream.get(model) ??
-    modelByBasename.get(basename) ??
+    specs.find((s) => s.shimModel === model) ??
+    specs.find((s) => s.upstreamModel === model) ??
+    specs.find((s) => s.basename === basename) ??
     makeFallbackSpec(model)
   );
 }
@@ -1411,11 +1393,36 @@ async function availableModelSpecs(): Promise<ModelSpec[]> {
     }
     const payload = (await upstream.json()) as { data?: Array<{ id?: string }> };
     const models = Array.isArray(payload.data) ? payload.data : [];
-    const available = new Set(models.flatMap((model) => (model.id ? [model.id] : [])));
-    return modelSpecs.filter((spec) => available.has(spec.upstreamModel));
+    // Build specs dynamically from what LiteLLM reports, including 1M shim variants.
+    const specs: ModelSpec[] = [];
+    const seen = new Set<string>();
+    for (const m of models) {
+      if (!m.id) continue;
+      const spec = getModelSpec(m.id);
+      if (!seen.has(spec.shimModel)) {
+        seen.add(spec.shimModel);
+        specs.push(spec);
+      }
+      // Add 1M shim variant if applicable.
+      const longBasename = LONG_CONTEXT_MODELS[spec.upstreamModel];
+      if (longBasename) {
+        const longShim = `${longBasename}:latest`;
+        if (!seen.has(longShim)) {
+          seen.add(longShim);
+          specs.push({
+            ...spec,
+            shimModel: longShim,
+            basename: longBasename,
+            parameterSize: `${spec.parameterSize}-1m`,
+            contextLength: 1000000,
+          });
+        }
+      }
+    }
+    return specs;
   } catch (error) {
-    serverLog(`warning: falling back to static model list: ${String(error)}`);
-    return modelSpecs;
+    serverLog(`warning: falling back to dynamic model list: ${String(error)}`);
+    return getModelSpecs();
   }
 }
 
@@ -1431,7 +1438,7 @@ async function handleApiTags(res: NodeResponse): Promise<void> {
 async function handleApiShow(req: IncomingMessage, res: NodeResponse): Promise<void> {
   try {
     const body = await readJson(req);
-    const spec = getModelSpec((body.name as string | undefined) || (body.model as string | undefined) || defaultSpec.shimModel);
+    const spec = getModelSpec((body.name as string | undefined) || (body.model as string | undefined) || getDefaultSpec().shimModel);
     sendJson(res, 200, {
       license: "proprietary",
       modelfile: "# LiteLLM Bedrock shim",
@@ -1609,7 +1616,7 @@ async function proxyV1Request(req: IncomingMessage, res: NodeResponse, url: URL)
       ) {
         try {
           const parsed = JSON.parse(rawBody) as JsonMap;
-          const spec = getModelSpec((parsed.model as string | undefined) || defaultSpec.shimModel);
+          const spec = getModelSpec((parsed.model as string | undefined) || getDefaultSpec().shimModel);
           model = spec.shimModel;
           parsed.model = spec.upstreamModel;
           sanitizeSamplingParams(parsed, spec);
