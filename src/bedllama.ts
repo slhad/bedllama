@@ -280,7 +280,29 @@ function buildModelSpecFromProfile(profileId: string): ModelSpec {
   };
 }
 
+function fetchEmbeddingModelIds(): Set<string> {
+  // Returns the set of base model IDs whose outputModalities include only EMBEDDING.
+  const result = run("aws", [
+    "bedrock", "list-foundation-models",
+    "--profile", config.awsProfile,
+    "--region", config.awsRegion,
+    "--query", "modelSummaries[?outputModalities==`['EMBEDDING']`].modelId",
+    "--output", "json",
+  ]);
+  if (result.status !== 0) {
+    return new Set();
+  }
+  try {
+    const ids = JSON.parse(result.stdout.trim()) as string[];
+    return new Set(ids);
+  } catch {
+    return new Set();
+  }
+}
+
 function fetchBedrockInferenceProfiles(): string[] {
+  const embeddingIds = fetchEmbeddingModelIds();
+
   const result = run("aws", [
     "bedrock", "list-inference-profiles",
     "--profile", config.awsProfile,
@@ -293,7 +315,13 @@ function fetchBedrockInferenceProfiles(): string[] {
     return [];
   }
   try {
-    return JSON.parse(result.stdout.trim()) as string[];
+    const ids = JSON.parse(result.stdout.trim()) as string[];
+    // Filter out embedding models by cross-referencing with foundation model output modalities.
+    // Profile IDs like eu.cohere.embed-v4:0 map to base model cohere.embed-v4:0.
+    return ids.filter((id) => {
+      const baseId = id.replace(/^(?:eu|us|global)\./, "");
+      return !embeddingIds.has(baseId);
+    });
   } catch {
     return [];
   }
