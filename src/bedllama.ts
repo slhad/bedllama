@@ -286,7 +286,7 @@ function fetchEmbeddingModelIds(): Set<string> {
     "bedrock", "list-foundation-models",
     "--profile", config.awsProfile,
     "--region", config.awsRegion,
-    "--query", "modelSummaries[?outputModalities==`['EMBEDDING']`].modelId",
+    "--query", "modelSummaries[?contains(outputModalities, 'EMBEDDING')].modelId",
     "--output", "json",
   ]);
   if (result.status !== 0) {
@@ -1447,10 +1447,12 @@ async function availableModelSpecs(): Promise<ModelSpec[]> {
     const payload = (await upstream.json()) as { data?: Array<{ id?: string }> };
     const models = Array.isArray(payload.data) ? payload.data : [];
     // Build specs dynamically from what LiteLLM reports, including 1M shim variants.
+    // Exclude embedding models (model name contains "embed") — they are not chat models.
     const specs: ModelSpec[] = [];
     const seen = new Set<string>();
     for (const m of models) {
       if (!m.id) continue;
+      if (m.id.includes("embed")) continue;
       const spec = getModelSpec(m.id);
       if (!seen.has(spec.shimModel)) {
         seen.add(spec.shimModel);
