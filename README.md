@@ -21,6 +21,14 @@ bedllama restart
 bedllama status
 bedllama logs [litellm|front|ollama|server|all]
 bedllama legend    # explain log field acronyms
+
+# systemd
+bedllama run       # run the full stack in the foreground (used by systemd ExecStart)
+bedllama install   # install ~/.config/systemd/user/bedllama.service and reload daemon
+bedllama uninstall # disable and remove the systemd user service
+
+# integrations
+bedllama vscode    # update VS Code chatLanguageModels.json with live Bedrock model data
 ```
 
 ## Install for local use
@@ -92,14 +100,8 @@ npm run typecheck
 - `BEDLLAMA_POSTGRES_PORT`
 - `BEDLLAMA_POSTGRES_PASSWORD`
 - `BEDLLAMA_POSTGRES_CONTAINER`
-- `BEDLLAMA_BEDROCK_MODEL_CLAUDE_HAIKU_4_5`
-- `BEDLLAMA_BEDROCK_MODEL_CLAUDE_SONNET_4_5`
-- `BEDLLAMA_BEDROCK_MODEL_CLAUDE_SONNET_4_6`
-- `BEDLLAMA_BEDROCK_MODEL_CLAUDE_OPUS_4_5`
-- `BEDLLAMA_BEDROCK_MODEL_CLAUDE_OPUS_4_6`
-- `BEDLLAMA_BEDROCK_MODEL_CLAUDE_OPUS_4_7`
-
 `BEDLLAMA_MODELS` accepts a comma-separated list.
+Available models are discovered dynamically from the Bedrock API — no per-model env vars needed.
 
 ## Admin UI and spend tracking
 

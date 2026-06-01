@@ -37,6 +37,7 @@ interface ModelSpec {
   contextLength: number;
   capabilities: string[];
   size: number;
+  maxOutputTokens: number;
 }
 
 interface LitellmModel {
@@ -223,11 +224,9 @@ const config = {
 
 // Models that expose a 1M-context variant via a separate shim name.
 // Key: upstream model name, value: shim suffix for the 1M variant.
-const LONG_CONTEXT_MODELS: Record<string, string> = {
-  "claude-sonnet-4-6": "claude-sonnet-4-6-1m",
-  "claude-opus-4-6": "claude-opus-4-6-1m",
-  "claude-opus-4-7": "claude-opus-4-7-1m",
-};
+// Threshold: Anthropic models whose probed max-output-tokens meet or exceed this
+// value automatically get a 1M-context shim variant registered at startup.
+const LONG_CONTEXT_OUTPUT_THRESHOLD = 100_000;
 
 // Model name fragments that are known NOT to support tool use via the Bedrock
 // Converse API, even though they output TEXT and support streaming.
@@ -295,7 +294,8 @@ function deriveParamSize(modelName: string, provider: string): string {
 
 function buildModelSpecFromProfile(
   profileId: string,
-  capabilityMap: Map<string, FoundationModelCapabilities>
+  capabilityMap: Map<string, FoundationModelCapabilities>,
+  maxOutputTokens = 32_000
 ): ModelSpec {
   const modelName = deriveModelNameFromProfileId(profileId);
   const provider = deriveProviderFromProfileId(profileId);
@@ -309,7 +309,63 @@ function buildModelSpecFromProfile(
     contextLength: 200000,
     capabilities: deriveCapabilitiesFromMap(profileId, capabilityMap),
     size: 3338801804,
+    maxOutputTokens,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Bedrock output-token probing
+// ---------------------------------------------------------------------------
+
+// Probes the real max-output-token limit for a single inference profile by
+// sending maxTokens=9_999_999 to the Converse API. Bedrock rejects the call
+// instantly (no generation, no charge) with a ValidationException that
+// includes the actual limit: "model limit of X".
+function probeMaxOutputTokensAsync(profileId: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const child = spawn(
+      "aws",
+      [
+        "bedrock-runtime", "converse",
+        "--model-id", profileId,
+        "--messages", JSON.stringify([{ role: "user", content: [{ text: "hi" }] }]),
+        "--inference-config", JSON.stringify({ maxTokens: 9_999_999 }),
+        "--profile", config.awsProfile,
+        "--region", config.awsRegion,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    let stderr = "";
+    child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+    child.on("close", () => {
+      const m = stderr.match(/model limit of (\d+)/);
+      resolve(m ? parseInt(m[1], 10) : null);
+    });
+  });
+}
+
+// Probes all given inference profiles concurrently and returns a map of
+// basename → maxOutputTokens. Deduplicates: when a basename has both eu and
+// global profiles, the eu one is preferred.
+async function probeAllMaxOutputTokens(
+  profileIds: string[]
+): Promise<Map<string, number>> {
+  const deduped = new Map<string, string>(); // basename → profileId
+  for (const id of profileIds) {
+    const basename = deriveModelNameFromProfileId(id);
+    const existing = deduped.get(basename);
+    // Prefer eu prefix; accept global as fallback.
+    if (!existing || id.startsWith("eu.")) {
+      deduped.set(basename, id);
+    }
+  }
+  const entries = await Promise.all(
+    Array.from(deduped.entries()).map(async ([basename, profileId]) => {
+      const limit = await probeMaxOutputTokensAsync(profileId);
+      return [basename, limit ?? 32_000] as const;
+    })
+  );
+  return new Map(entries);
 }
 
 interface FoundationModelCapabilities {
@@ -383,7 +439,8 @@ function fetchBedrockInferenceProfiles(
 
 function buildDynamicModels(
   profileIds: string[],
-  capabilityMap: Map<string, FoundationModelCapabilities>
+  capabilityMap: Map<string, FoundationModelCapabilities>,
+  maxOutputMap: Map<string, number> = new Map()
 ): { modelSpecs: ModelSpec[]; litellmModelMap: LitellmModel[] } {
   const seen = new Set<string>();
   const modelSpecs: ModelSpec[] = [];
@@ -391,32 +448,36 @@ function buildDynamicModels(
 
   for (const profileId of profileIds) {
     const modelName = deriveModelNameFromProfileId(profileId);
-    if (seen.has(modelName)) {
-      continue;
-    }
+    if (seen.has(modelName)) continue;
     seen.add(modelName);
 
     const provider = deriveProviderFromProfileId(profileId);
     const family = deriveFamilyFromModelName(modelName, provider);
     const capabilities = deriveCapabilitiesFromMap(profileId, capabilityMap);
-    modelSpecs.push(buildModelSpecFromProfile(profileId, capabilityMap));
+    const maxOutput = maxOutputMap.get(modelName) ?? 32_000;
+
+    modelSpecs.push(buildModelSpecFromProfile(profileId, capabilityMap, maxOutput));
     litellmModelMap.push({
       modelName,
       bedrockModel: `bedrock/${profileId}`,
     });
 
-    // Add a 1M-context shim variant if this model supports it.
-    const longContextBasename = LONG_CONTEXT_MODELS[modelName];
-    if (longContextBasename) {
+    // Dynamically add a 1M-context shim variant for Anthropic models whose
+    // probed output capacity meets the threshold. The shimModel name is what
+    // clients use; proxyV1Request rewrites it to upstreamModel before
+    // forwarding to LiteLLM, so LiteLLM never needs to know the -1m name.
+    if (provider === "anthropic" && maxOutput >= LONG_CONTEXT_OUTPUT_THRESHOLD) {
+      const longBasename = `${modelName}-1m`;
       modelSpecs.push({
         upstreamModel: modelName,
-        shimModel: `${longContextBasename}:latest`,
-        basename: longContextBasename,
+        shimModel: `${longBasename}:latest`,
+        basename: longBasename,
         family,
         parameterSize: `${deriveParamSize(modelName, provider)}-1m`,
-        contextLength: 1000000,
+        contextLength: 1_000_000,
         capabilities,
         size: 3338801804,
+        maxOutputTokens: maxOutput,
       });
     }
   }
@@ -986,7 +1047,10 @@ async function startStack(): Promise<void> {
     fail("No Bedrock inference profiles found. Check your AWS credentials and region.");
   }
 
-  const { modelSpecs, litellmModelMap } = buildDynamicModels(profileIds, capabilityMap);
+  process.stdout.write(`Probing output limits for ${profileIds.length} model(s) in parallel...\n`);
+  const maxOutputMap = await probeAllMaxOutputTokens(profileIds);
+
+  const { modelSpecs, litellmModelMap } = buildDynamicModels(profileIds, capabilityMap, maxOutputMap);
   dynamicModelSpecs = modelSpecs;
   dynamicLitellmModelMap = litellmModelMap;
 
@@ -1276,6 +1340,7 @@ function makeFallbackSpec(model: string): ModelSpec {
     contextLength: 200000,
     capabilities: NO_TOOLS_MODELS.some((f) => basename.includes(f)) ? [] : ["tools", "vision"],
     size: 3338801804,
+    maxOutputTokens: 32_000,
   };
 }
 
@@ -1531,20 +1596,12 @@ async function availableModelSpecs(): Promise<ModelSpec[]> {
         seen.add(spec.shimModel);
         specs.push(spec);
       }
-      // Add 1M shim variant if applicable.
-      const longBasename = LONG_CONTEXT_MODELS[spec.upstreamModel];
-      if (longBasename) {
-        const longShim = `${longBasename}:latest`;
-        if (!seen.has(longShim)) {
-          seen.add(longShim);
-          specs.push({
-            ...spec,
-            shimModel: longShim,
-            basename: longBasename,
-            parameterSize: `${spec.parameterSize}-1m`,
-            contextLength: 1000000,
-          });
-        }
+      // Include the 1M variant if buildDynamicModels registered one.
+      const longShimName = `${spec.upstreamModel}-1m:latest`;
+      const longSpec = dynamicModelSpecs.find((s) => s.shimModel === longShimName);
+      if (longSpec && !seen.has(longSpec.shimModel)) {
+        seen.add(longSpec.shimModel);
+        specs.push(longSpec);
       }
     }
     return specs;
@@ -1845,7 +1902,7 @@ async function handleOllamaRequest(req: IncomingMessage, res: NodeResponse): Pro
   sendJson(res, 404, { error: `Unsupported path: ${req.method} ${url.pathname}` });
 }
 
-function startIntegratedServer(): void {
+function startIntegratedServer(onShutdown?: () => void): void {
   // Load model specs passed from the parent `start` process.
   const specsEnv = process.env.BEDLLAMA_MODEL_SPECS;
   if (specsEnv) {
@@ -1869,6 +1926,7 @@ function startIntegratedServer(): void {
   });
 
   const closeAll = (): void => {
+    onShutdown?.();
     frontServer.close();
     ollamaServer.close();
     setTimeout(() => process.exit(0), 50);
@@ -1889,6 +1947,363 @@ function startIntegratedServer(): void {
 
   frontServer.listen(config.ports.front, config.hosts.front, onListening);
   ollamaServer.listen(config.ports.ollama, config.hosts.ollama, onListening);
+}
+
+async function runStack(): Promise<void> {
+  requireDependencies();
+
+  process.stdout.write("Fetching available Bedrock model capabilities...\n");
+  const capabilityMap = fetchFoundationModelCapabilities();
+
+  process.stdout.write("Fetching available Bedrock inference profiles...\n");
+  const allProfileIds = fetchBedrockInferenceProfiles(capabilityMap);
+
+  const profileIds = config.models.length > 0
+    ? (() => {
+        const allowed = new Set(
+          config.models.map((m) => (m.endsWith(":latest") ? m.slice(0, -7) : m))
+        );
+        return allProfileIds.filter((id) => allowed.has(deriveModelNameFromProfileId(id)));
+      })()
+    : allProfileIds;
+
+  if (profileIds.length === 0) {
+    fail("No Bedrock inference profiles found. Check your AWS credentials and region.");
+  }
+
+  process.stdout.write(`Probing output limits for ${profileIds.length} model(s) in parallel...\n`);
+  const maxOutputMap = await probeAllMaxOutputTokens(profileIds);
+
+  const { modelSpecs, litellmModelMap } = buildDynamicModels(profileIds, capabilityMap, maxOutputMap);
+  dynamicModelSpecs = modelSpecs;
+  dynamicLitellmModelMap = litellmModelMap;
+
+  if (config.adminUi) {
+    startPostgres();
+    process.stdout.write("Waiting for PostgreSQL to be ready...\n");
+    await waitForTcp("127.0.0.1", config.postgresPort);
+    await waitForPostgresReady();
+    prismaDbPush();
+  }
+
+  writeLitellmConfig();
+
+  // Start LiteLLM as a tracked child so systemd sees the full process tree.
+  const litellmChild = spawn(config.litellmBin, litellmArgs(), {
+    env: litellmEnv(),
+    stdio: "inherit",
+    detached: false,
+  });
+
+  litellmChild.on("exit", (code, signal) => {
+    process.stderr.write(`LiteLLM exited unexpectedly (code=${code} signal=${signal}), shutting down\n`);
+    if (config.adminUi) stopPostgres();
+    process.exit(1); // non-zero so systemd Restart=on-failure triggers
+  });
+
+  try {
+    await waitForHttp(`http://127.0.0.1:${config.ports.litellm}/v1/models`, {
+      Authorization: `Bearer ${config.apiKey}`,
+    });
+  } catch (error) {
+    const litellmLog = tailLines(logFilePath(config.processNames.litellm), 40);
+    litellmChild.kill("SIGTERM");
+    if (config.adminUi) stopPostgres();
+    if (litellmLog) {
+      process.stderr.write("\nRecent LiteLLM log output:\n");
+      process.stderr.write(`${litellmLog}\n`);
+    }
+    fail(String(error));
+  }
+
+  process.stdout.write(`bedllama ready\n`);
+  process.stdout.write(`  OpenAI: http://${config.hosts.front}:${config.ports.front}/v1\n`);
+  process.stdout.write(`  Ollama: http://${config.hosts.ollama}:${config.ports.ollama}\n`);
+  for (const spec of modelSpecs) {
+    process.stdout.write(`  model: ${spec.shimModel}\n`);
+  }
+
+  const onShutdown = (): void => {
+    // Detach the unexpected-exit handler so killing litellm intentionally
+    // doesn't trigger a non-zero exit from this process.
+    litellmChild.removeAllListeners("exit");
+    litellmChild.kill("SIGTERM");
+    if (config.adminUi) stopPostgres();
+  };
+
+  startIntegratedServer(onShutdown);
+}
+
+function installService(): void {
+  if (process.platform === "win32") {
+    fail("systemd is not available on Windows. Use WSL2 or run bedllama start manually.");
+  }
+
+  const hasSystemctl = run("which", ["systemctl"]).status === 0;
+  if (!hasSystemctl) {
+    fail("systemctl not found — is systemd running on this system?");
+  }
+
+  // Prefer the linked bedllama bin from PATH; fall back to node + this script.
+  const whichResult = run("which", ["bedllama"]);
+  const execStart = whichResult.status === 0 && whichResult.stdout.trim()
+    ? `${whichResult.stdout.trim()} run`
+    : `${process.execPath} ${__filename} run`;
+
+  const serviceDir = path.join(home, ".config", "systemd", "user");
+  const servicePath = path.join(serviceDir, "bedllama.service");
+
+  const unit = [
+    "[Unit]",
+    "Description=bedllama — AWS Bedrock LLM proxy (OpenAI + Ollama compatible)",
+    "After=network-online.target",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    "Type=simple",
+    `ExecStart=${execStart}`,
+    "Restart=on-failure",
+    "RestartSec=10",
+    "TimeoutStartSec=120",
+    "StandardOutput=journal",
+    "StandardError=journal",
+    "SyslogIdentifier=bedllama",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+
+  mkdirSync(serviceDir, { recursive: true });
+  writeFileSync(servicePath, unit, { encoding: "utf8", mode: 0o644 });
+
+  run("systemctl", ["--user", "daemon-reload"]);
+
+  process.stdout.write(`Installed: ${servicePath}\n`);
+  process.stdout.write(`ExecStart: ${execStart}\n`);
+  process.stdout.write("\nNext steps:\n");
+  process.stdout.write("  systemctl --user enable --now bedllama   # start now + on login\n");
+  process.stdout.write("  systemctl --user status bedllama          # check state\n");
+  process.stdout.write("  journalctl --user -fu bedllama            # follow logs\n");
+}
+
+function uninstallService(): void {
+  const servicePath = path.join(home, ".config", "systemd", "user", "bedllama.service");
+
+  // Stop and disable — ignore errors (service may not be enabled/running).
+  run("systemctl", ["--user", "disable", "--now", "bedllama"]);
+
+  if (existsSync(servicePath)) {
+    unlinkSync(servicePath);
+    process.stdout.write(`Removed: ${servicePath}\n`);
+  } else {
+    process.stdout.write("Service file not found (already uninstalled?)\n");
+  }
+
+  run("systemctl", ["--user", "daemon-reload"]);
+  process.stdout.write("bedllama service uninstalled\n");
+}
+
+// ---------------------------------------------------------------------------
+// VS Code integration
+// ---------------------------------------------------------------------------
+
+function findVSCodeUserDirs(): string[] {
+  const dirs: string[] = [];
+  const appNames = ["Code", "Code - Insiders"];
+  if (process.platform === "darwin") {
+    const appSupport = path.join(home, "Library", "Application Support");
+    for (const name of appNames) {
+      const d = path.join(appSupport, name, "User");
+      if (existsSync(d)) dirs.push(d);
+    }
+  } else {
+    const xdgConfig = process.env.XDG_CONFIG_HOME ?? path.join(home, ".config");
+    for (const name of appNames) {
+      const d = path.join(xdgConfig, name, "User");
+      if (existsSync(d)) dirs.push(d);
+    }
+  }
+  return dirs;
+}
+
+/** Extract the minor version from a Claude basename, e.g. "claude-opus-4-6" → 6, "claude-sonnet-4" → 0. */
+function claudeMinorVersion(basename: string): number {
+  const m = basename.replace(/-1m$/, "").match(/(\d+)-(\d+)$/);
+  return m ? parseInt(m[2], 10) : 0;
+}
+
+function formatModelDisplayName(basename: string, contextLength: number): string {
+  // claude-sonnet-4-6  → "Claude Sonnet 4.6"
+  // claude-opus-4-7-1m → "Claude Opus 4.7 · 1M"
+  const m = basename.match(/^claude-([a-z]+)-(\d+)-(\d+)(?:-1m)?$/);
+  if (m) {
+    const tierCap = m[1].charAt(0).toUpperCase() + m[1].slice(1);
+    const suffix = contextLength >= 1_000_000 ? " \xb7 1M" : "";
+    return `Claude ${tierCap} ${m[2]}.${m[3]}${suffix}`;
+  }
+  // Generic: capitalise each hyphen-separated word
+  return basename.split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+function maxOutputTokensForModel(basename: string): number {
+  if (basename.includes("opus")) return 32_000;
+  if (basename.startsWith("claude")) return 64_000;
+  return 32_000;
+}
+
+// specFromModelId is kept for backward-compat but now populates maxOutputTokens.
+function specFromModelId(modelId: string): ModelSpec {
+  const basename = modelId.endsWith(":latest") ? modelId.slice(0, -7) : modelId;
+  const is1M = basename.endsWith("-1m");
+  return {
+    upstreamModel: basename,
+    shimModel: `${basename}:latest`,
+    basename,
+    family: "unknown",
+    parameterSize: basename,
+    contextLength: is1M ? 1_000_000 : 200_000,
+    capabilities: NO_TOOLS_MODELS.some((f) => basename.includes(f)) ? [] : ["tools", "vision"],
+    size: 0,
+    maxOutputTokens: 32_000,
+  };
+}
+
+async function configureVSCode(): Promise<void> {
+  requireDependencies();
+
+  const frontUrl = `http://${config.hosts.front}:${config.ports.front}`;
+
+  // Always fetch inference profiles — needed for probing regardless of whether
+  // bedllama is running. This is a fast list call (~1s).
+  process.stdout.write("Fetching Bedrock inference profiles...\n");
+  const capabilityMap = fetchFoundationModelCapabilities();
+  const allProfileIds = fetchBedrockInferenceProfiles(capabilityMap);
+  const profileIds = config.models.length > 0
+    ? (() => {
+        const allowed = new Set(
+          config.models.map((m) => (m.endsWith(":latest") ? m.slice(0, -7) : m))
+        );
+        return allProfileIds.filter((id) => allowed.has(deriveModelNameFromProfileId(id)));
+      })()
+    : allProfileIds;
+  if (profileIds.length === 0) {
+    fail("No Bedrock inference profiles found. Check your AWS credentials and region.");
+  }
+
+  // Probe max output tokens for all models in parallel.
+  process.stdout.write(`Probing output limits for ${profileIds.length} model(s)...\n`);
+  const maxOutputMap = await probeAllMaxOutputTokens(profileIds);
+
+  // Build full model specs with probe data (includes 1M variants).
+  const { modelSpecs } = buildDynamicModels(profileIds, capabilityMap, maxOutputMap);
+
+  // If bedllama is running, filter to only the models it currently serves
+  // (respects config.models filter and shows the same set VS Code will use).
+  let finalSpecs = modelSpecs;
+  try {
+    const response = await fetch(`${frontUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${config.apiKey}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (response.ok) {
+      const payload = await response.json() as { data?: Array<{ id: string }> };
+      const liveIds = new Set(
+        (payload.data ?? []).map((m) => m.id.replace(/:latest$/, ""))
+      );
+      // Keep specs whose basename is in the live set; also keep specs whose
+      // upstreamModel is live (catches 1M variants whose upstreamModel is served).
+      finalSpecs = modelSpecs.filter(
+        (s) => liveIds.has(s.basename) || liveIds.has(s.upstreamModel)
+      );
+      process.stdout.write(`Filtered to ${finalSpecs.length} model(s) from running bedllama\n`);
+    }
+  } catch {
+    // bedllama not running — use all discovered specs.
+  }
+
+  for (const spec of finalSpecs) {
+    const ctx = spec.contextLength >= 1_000_000 ? "1M" : "200K";
+    const out = spec.maxOutputTokens.toLocaleString();
+    process.stdout.write(`  ${spec.basename.padEnd(28)} ctx=${ctx}  out=${out}\n`);
+  }
+
+  const bedllamaEntry = {
+    name: "bedllama",
+    vendor: "customendpoint",
+    apiKey: config.apiKey,
+    apiType: "chat-completions",
+    models: finalSpecs.map((spec) => {
+      const entry: Record<string, unknown> = {
+        id: spec.basename,
+        name: formatModelDisplayName(spec.basename, spec.contextLength),
+        url: `${frontUrl}/v1/chat/completions`,
+        toolCalling: spec.capabilities.includes("tools"),
+        vision: spec.capabilities.includes("vision"),
+        maxInputTokens: (() => {
+          // VS Code displays contextSize = maxInputTokens + maxOutputTokens.
+          // Set maxInputTokens = targetWindow - maxOutputTokens so the sum
+          // equals the intended context window.
+          let targetWindow: number;
+          if (spec.contextLength >= 1_000_000) {
+            // Already a 1M variant.
+            targetWindow = 1_000_000;
+          } else {
+            const has1MSibling = finalSpecs.some(
+              (s) => s.basename === `${spec.basename}-1m`
+            );
+            if (has1MSibling) {
+              // Base entry of a 200K/1M pair — keep this one at 200K.
+              targetWindow = 200_000;
+            } else if (spec.family === "claude" && claudeMinorVersion(spec.basename) >= 6) {
+              // Claude 4.6+ natively supports 1M on Bedrock even without a
+              // separate -1m variant in the registry.
+              targetWindow = 1_000_000;
+            } else {
+              targetWindow = spec.contextLength; // 200K default
+            }
+          }
+          return Math.max(1, targetWindow - spec.maxOutputTokens);
+        })(),
+        maxOutputTokens: spec.maxOutputTokens,
+      };
+      // Expose thinking + reasoning effort for high-output Anthropic models.
+      // LiteLLM translates reasoning_effort → thinking.budget_tokens (4.5) or
+      // thinking.type="adaptive" (4.6+) before forwarding to Bedrock Converse.
+      if (spec.family === "claude" && spec.maxOutputTokens >= LONG_CONTEXT_OUTPUT_THRESHOLD) {
+        entry.thinking = true;
+        entry.supportsReasoningEffort = ["low", "medium", "high"];
+        entry.reasoningEffortFormat = "chat-completions";
+      }
+      return entry;
+    }),
+  };
+
+  const userDirs = findVSCodeUserDirs();
+  if (userDirs.length === 0) {
+    process.stderr.write("No VS Code User directories found. Is VS Code installed?\n");
+    process.exit(1);
+  }
+
+  for (const userDir of userDirs) {
+    const configPath = path.join(userDir, "chatLanguageModels.json");
+    let existing: Record<string, unknown>[] = [];
+    if (existsSync(configPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
+        existing = Array.isArray(parsed) ? (parsed as Record<string, unknown>[]) : [];
+      } catch {
+        existing = [];
+      }
+    }
+    // Replace the bedllama customendpoint entry; preserve everything else.
+    const filtered = existing.filter(
+      (e) => !(e.vendor === "customendpoint" && e.name === "bedllama")
+    );
+    filtered.push(bedllamaEntry as unknown as Record<string, unknown>);
+    writeFileSync(configPath, JSON.stringify(filtered, null, "\t") + "\n", "utf8");
+    process.stdout.write(`Updated: ${configPath}\n`);
+  }
 }
 
 function legend(): void {
@@ -1927,7 +2342,7 @@ overhead chain reference (normal home conditions):
 }
 
 function usage(exitCode = 0): never {
-  const text = `usage: bedllama <start|stop|restart|status|logs>
+  const text = `usage: bedllama <command>
 
 commands:
   init      create a default config.jsonc in the current directory
@@ -1938,6 +2353,15 @@ commands:
   logs      show recent logs; optional target: litellm|front|ollama|server|all
             use -f or --follow to tail and follow new output
   legend    explain log field acronyms and prefixes
+
+systemd:
+  run       run the full stack in the foreground (used by systemd ExecStart)
+  install   install ~/.config/systemd/user/bedllama.service and reload daemon
+  uninstall disable and remove the systemd user service
+
+integrations:
+  vscode    update VS Code chatLanguageModels.json with bedllama custom endpoint
+            fetches models from a running bedllama, or discovers from Bedrock
 `;
   if (exitCode === 0) {
     process.stdout.write(text);
@@ -2028,6 +2452,18 @@ switch (command) {
     break;
   case "serve":
     startIntegratedServer();
+    break;
+  case "run":
+    void runStack().catch((error) => fail(String(error)));
+    break;
+  case "install":
+    installService();
+    break;
+  case "uninstall":
+    uninstallService();
+    break;
+  case "vscode":
+    void configureVSCode().catch((error) => fail(String(error)));
     break;
   case "help":
   case "--help":
