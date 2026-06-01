@@ -992,6 +992,7 @@ function generateLitellmConfig(): string {
   if (config.adminUi) {
     lines.push(`  database_url: ${yamlScalar(postgresUrl())}`);
     lines.push("  store_model_in_db: true");
+    lines.push("  store_prompts_in_spend_logs: true");
   }
   lines.push("");
   if (config.adminUi) {
