@@ -1853,6 +1853,11 @@ async function handleFrontRequest(req: IncomingMessage, res: NodeResponse): Prom
 
   serverLog(`front ${req.method} ${url.pathname}${url.search}`);
 
+  if (req.method === "GET" && url.pathname === "/api/specs") {
+    sendJson(res, 200, { specs: getModelSpecs() });
+    return;
+  }
+
   if (url.pathname === "/") {
     sendJson(res, 200, { service: "bedllama-front" });
     return;
