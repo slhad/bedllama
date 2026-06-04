@@ -122,6 +122,20 @@ interface UserConfig {
   awsRegion?: string;
   apiKey?: string;
   models?: string;
+  /**
+   * Sacrifice prompt/spend logging for lower streaming latency.
+   *
+   * When true (and adminUi is also true):
+   *   - store_prompts_in_spend_logs is set to false  (skips storing the full
+   *     prompt+response text in the spend-log table — token counts and cost
+   *     are still tracked, the admin UI still works)
+   *   - disable_streaming_logging is set to true  (removes per-chunk
+   *     thread-pool dispatches; saves ~5–15 ms on long responses)
+   *
+   * When false/unset (default): full spend + prompt logging, higher latency.
+   * Has no effect when adminUi is false (non-UI mode is always lean).
+   */
+  leanProxy?: boolean;
 }
 
 function stripJsoncComments(src: string): string {
@@ -172,7 +186,9 @@ function loadUserConfig(): UserConfig {
     if (existsSync(candidate)) {
       try {
         const raw = readFileSync(candidate, "utf8");
-        return JSON.parse(stripJsoncComments(raw)) as UserConfig;
+        // Strip comments, then trailing commas (both are valid JSONC but not JSON).
+        const stripped = stripJsoncComments(raw).replace(/,\s*([\]\}])/g, "$1");
+        return JSON.parse(stripped) as UserConfig;
       } catch (err) {
         process.stderr.write(`Warning: failed to parse ${candidate}: ${err}\n`);
       }
@@ -216,16 +232,17 @@ const config = {
   postgresPassword: env("BEDLLAMA_POSTGRES_PASSWORD", userConfig.postgresPassword ?? "bedllama"),
   postgresContainerName: env("BEDLLAMA_POSTGRES_CONTAINER", "bedllama-postgres"),
   models: envList("BEDLLAMA_MODELS", userConfig.models ? userConfig.models.split(",").map((m) => m.trim()).filter(Boolean) : []),
+  leanProxy: userConfig.leanProxy ?? false,
 };
 
 // ---------------------------------------------------------------------------
 // Dynamic model discovery from AWS Bedrock inference profiles
 // ---------------------------------------------------------------------------
 
-// Models that expose a 1M-context variant via a separate shim name.
-// Key: upstream model name, value: shim suffix for the 1M variant.
+// Models that expose extended-context variants via separate shim names.
 // Threshold: Anthropic models whose probed max-output-tokens meet or exceed this
-// value automatically get a 1M-context shim variant registered at startup.
+// value automatically get both a 400K-context and a 1M-context shim variant
+// registered at startup.
 const LONG_CONTEXT_OUTPUT_THRESHOLD = 100_000;
 
 // Model name fragments that are known NOT to support tool use via the Bedrock
@@ -462,11 +479,23 @@ function buildDynamicModels(
       bedrockModel: `bedrock/${profileId}`,
     });
 
-    // Dynamically add a 1M-context shim variant for Anthropic models whose
-    // probed output capacity meets the threshold. The shimModel name is what
-    // clients use; proxyV1Request rewrites it to upstreamModel before
-    // forwarding to LiteLLM, so LiteLLM never needs to know the -1m name.
+    // Dynamically add 400K and 1M-context shim variants for Anthropic models
+    // whose probed output capacity meets the threshold. The shimModel name is
+    // what clients use; proxyV1Request rewrites it to upstreamModel before
+    // forwarding to LiteLLM, so LiteLLM never needs to know these shim names.
     if (provider === "anthropic" && maxOutput >= LONG_CONTEXT_OUTPUT_THRESHOLD) {
+      const midBasename = `${modelName}-400k`;
+      modelSpecs.push({
+        upstreamModel: modelName,
+        shimModel: `${midBasename}:latest`,
+        basename: midBasename,
+        family,
+        parameterSize: `${deriveParamSize(modelName, provider)}-400k`,
+        contextLength: 400_000,
+        capabilities,
+        size: 3338801804,
+        maxOutputTokens: maxOutput,
+      });
       const longBasename = `${modelName}-1m`;
       modelSpecs.push({
         upstreamModel: modelName,
@@ -990,15 +1019,46 @@ function generateLitellmConfig(): string {
   lines.push("general_settings:");
   lines.push(`  master_key: ${yamlScalar(config.apiKey)}`);
   if (config.adminUi) {
+    // Admin UI requires DB for spend tracking and model storage.
     lines.push(`  database_url: ${yamlScalar(postgresUrl())}`);
     lines.push("  store_model_in_db: true");
-    lines.push("  store_prompts_in_spend_logs: true");
+    if (config.leanProxy) {
+      // leanProxy=true: omit prompt text from spend logs to reduce DB write
+      // cost. Token counts and per-request cost are still recorded; the admin
+      // UI continues to work normally.
+      lines.push("  store_prompts_in_spend_logs: false");
+    } else {
+      // Default: store the full prompt + response so the admin UI shows the
+      // complete request history.
+      lines.push("  store_prompts_in_spend_logs: true");
+    }
+    // Batch DB writes every 60 s instead of the default 10 s — safe regardless
+    // of leanProxy because no data is lost, just flushed less frequently.
+    lines.push("  proxy_batch_write_at: 60");
+  } else {
+    // No admin UI — disable all spend/log DB overhead for minimum latency.
+    lines.push("  disable_spend_logs: true");
+  }
+  // Health-check polling is off by default; make it explicit to prevent
+  // accidental activation via env-var override.
+  lines.push("  background_health_checks: false");
+  lines.push("");
+  lines.push("litellm_settings:");
+  if (config.adminUi) {
+    lines.push("  ui_access_mode: \"all\"");
+    if (config.leanProxy) {
+      // leanProxy=true: also skip per-chunk thread-pool dispatches. The admin
+      // UI still works; only the per-request spend-log write path is affected.
+      lines.push("  disable_streaming_logging: true");
+    }
+  } else {
+    // Per-chunk success-handler dispatches add measurable latency on long
+    // streaming responses (one thread-pool submit + future.result() per token).
+    // Disable them when we have no spend tracking or custom loggers to fire.
+    lines.push("  disable_streaming_logging: true");
   }
   lines.push("");
   if (config.adminUi) {
-    lines.push("litellm_settings:");
-    lines.push("  ui_access_mode: \"all\"");
-    lines.push("");
     lines.push("environment_variables:");
     lines.push(`  UI_USERNAME: ${yamlScalar(config.adminUiUsername)}`);
     lines.push(`  UI_PASSWORD: ${yamlScalar(config.adminUiPassword)}`);
@@ -1308,6 +1368,15 @@ async function litellmFetch(requestPath: string, init: NodeFetchInit = {}): Prom
   });
 }
 
+// Hop-by-hop headers (RFC 7230 §6.1) must never be forwarded by a proxy.
+// Forwarding `connection` in particular can break keep-alive pooling:
+// if a client sends `connection: close`, LiteLLM would close the socket
+// and force a new TCP handshake for every request.
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailers", "transfer-encoding", "upgrade",
+]);
+
 async function proxyStream(upstream: Response, res: NodeResponse): Promise<void> {
   const extraHeaders: Record<string, string> = {};
   for (const [key, value] of upstream.headers.entries()) {
@@ -1325,7 +1394,8 @@ async function proxyStream(upstream: Response, res: NodeResponse): Promise<void>
     return;
   }
   for await (const chunk of upstream.body as AsyncIterable<Uint8Array>) {
-    res.write(Buffer.from(chunk));
+    // Pass the Uint8Array directly — Buffer.from() would copy every byte.
+    res.write(chunk);
   }
   res.end();
 }
@@ -1476,12 +1546,16 @@ async function streamOpenAiToOllama(
   const decoder = new TextDecoder();
   let buffer = "";
 
+  // Snapshot the timestamp once for the whole stream — calling new Date() per
+  // token wastes ~0.5 µs × token-count and generates GC pressure.
+  const createdAt = new Date().toISOString();
+
   const writeChunk = (content: string, toolCalls: unknown): void => {
     const chunk =
       kind === "chat"
         ? {
             model: spec.shimModel,
-            created_at: new Date().toISOString(),
+            created_at: createdAt,
             message: {
               role: "assistant",
               content,
@@ -1491,7 +1565,7 @@ async function streamOpenAiToOllama(
           }
         : {
             model: spec.shimModel,
-            created_at: new Date().toISOString(),
+            created_at: createdAt,
             response: content,
             done: false,
           };
@@ -1515,14 +1589,14 @@ async function streamOpenAiToOllama(
           kind === "chat"
             ? {
                 model: spec.shimModel,
-                created_at: new Date().toISOString(),
+                created_at: createdAt,
                 message: { role: "assistant", content: "" },
                 done: true,
                 done_reason: "stop",
               }
             : {
                 model: spec.shimModel,
-                created_at: new Date().toISOString(),
+                created_at: createdAt,
                 response: "",
                 done: true,
                 done_reason: "stop",
@@ -1597,7 +1671,13 @@ async function availableModelSpecs(): Promise<ModelSpec[]> {
         seen.add(spec.shimModel);
         specs.push(spec);
       }
-      // Include the 1M variant if buildDynamicModels registered one.
+      // Include the 400K and 1M variants if buildDynamicModels registered them.
+      const midShimName = `${spec.upstreamModel}-400k:latest`;
+      const midSpec = dynamicModelSpecs.find((s) => s.shimModel === midShimName);
+      if (midSpec && !seen.has(midSpec.shimModel)) {
+        seen.add(midSpec.shimModel);
+        specs.push(midSpec);
+      }
       const longShimName = `${spec.upstreamModel}-1m:latest`;
       const longSpec = dynamicModelSpecs.find((s) => s.shimModel === longShimName);
       if (longSpec && !seen.has(longSpec.shimModel)) {
@@ -1780,7 +1860,8 @@ async function proxyV1Request(req: IncomingMessage, res: NodeResponse, url: URL)
   try {
     const headers = new Headers();
     for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === "string" && key.toLowerCase() !== "host") {
+      const lc = key.toLowerCase();
+      if (typeof value === "string" && lc !== "host" && !HOP_BY_HOP_HEADERS.has(lc)) {
         headers.set(key, value);
       }
     }
@@ -2140,12 +2221,13 @@ function claudeMinorVersion(basename: string): number {
 }
 
 function formatModelDisplayName(basename: string, contextLength: number): string {
-  // claude-sonnet-4-6  → "Claude Sonnet 4.6"
-  // claude-opus-4-7-1m → "Claude Opus 4.7 · 1M"
-  const m = basename.match(/^claude-([a-z]+)-(\d+)-(\d+)(?:-1m)?$/);
+  // claude-sonnet-4-6      → "Claude Sonnet 4.6"
+  // claude-opus-4-7-400k   → "Claude Opus 4.7 · 400K"
+  // claude-opus-4-7-1m     → "Claude Opus 4.7 · 1M"
+  const m = basename.match(/^claude-([a-z]+)-(\d+)-(\d+)(?:-(400k|1m))?$/);
   if (m) {
     const tierCap = m[1].charAt(0).toUpperCase() + m[1].slice(1);
-    const suffix = contextLength >= 1_000_000 ? " \xb7 1M" : "";
+    const suffix = contextLength >= 1_000_000 ? " \xb7 1M" : contextLength >= 400_000 ? " \xb7 400K" : "";
     return `Claude ${tierCap} ${m[2]}.${m[3]}${suffix}`;
   }
   // Generic: capitalise each hyphen-separated word
@@ -2162,13 +2244,14 @@ function maxOutputTokensForModel(basename: string): number {
 function specFromModelId(modelId: string): ModelSpec {
   const basename = modelId.endsWith(":latest") ? modelId.slice(0, -7) : modelId;
   const is1M = basename.endsWith("-1m");
+  const is400K = basename.endsWith("-400k");
   return {
     upstreamModel: basename,
     shimModel: `${basename}:latest`,
     basename,
     family: "unknown",
     parameterSize: basename,
-    contextLength: is1M ? 1_000_000 : 200_000,
+    contextLength: is1M ? 1_000_000 : is400K ? 400_000 : 200_000,
     capabilities: NO_TOOLS_MODELS.some((f) => basename.includes(f)) ? [] : ["tools", "vision"],
     size: 0,
     maxOutputTokens: 32_000,
@@ -2229,7 +2312,7 @@ async function configureVSCode(): Promise<void> {
   }
 
   for (const spec of finalSpecs) {
-    const ctx = spec.contextLength >= 1_000_000 ? "1M" : "200K";
+    const ctx = spec.contextLength >= 1_000_000 ? "1M" : spec.contextLength >= 400_000 ? "400K" : "200K";
     const out = spec.maxOutputTokens.toLocaleString();
     process.stdout.write(`  ${spec.basename.padEnd(28)} ctx=${ctx}  out=${out}\n`);
   }
@@ -2254,12 +2337,15 @@ async function configureVSCode(): Promise<void> {
           if (spec.contextLength >= 1_000_000) {
             // Already a 1M variant.
             targetWindow = 1_000_000;
+          } else if (spec.contextLength >= 400_000) {
+            // Already a 400K variant.
+            targetWindow = 400_000;
           } else {
             const has1MSibling = finalSpecs.some(
               (s) => s.basename === `${spec.basename}-1m`
             );
             if (has1MSibling) {
-              // Base entry of a 200K/1M pair — keep this one at 200K.
+              // Base entry of a 200K/400K/1M group — keep this one at 200K.
               targetWindow = 200_000;
             } else if (spec.family === "claude" && claudeMinorVersion(spec.basename) >= 6) {
               // Claude 4.6+ natively supports 1M on Bedrock even without a

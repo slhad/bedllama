@@ -46,6 +46,8 @@ Then use:
 bedllama start
 ```
 
+`config.jsonc` is parsed as JSONC: comments and trailing commas are accepted.
+
 ## LiteLLM config generation
 
 `bedllama` writes its own LiteLLM config before startup instead of relying on
@@ -103,6 +105,16 @@ npm run typecheck
 `BEDLLAMA_MODELS` accepts a comma-separated list.
 Available models are discovered dynamically from the Bedrock API — no per-model env vars needed.
 
+Anthropic models that expose extended output limits are also surfaced with
+additional shim IDs for larger context windows:
+
+- `claude-sonnet-4-6:latest` for the base 200K entry
+- `claude-sonnet-4-6-400k:latest` for the 400K variant
+- `claude-sonnet-4-6-1m:latest` for the 1M variant
+
+These map back to the same upstream Bedrock model; bedllama rewrites the shim
+name before forwarding to LiteLLM.
+
 ## Admin UI and spend tracking
 
 The LiteLLM admin UI gives you a web dashboard to inspect usage, costs per
@@ -151,6 +163,37 @@ Spend is tracked automatically for every request once the DB is connected.
 LiteLLM logs each call to `LiteLLMSpendLogs` and aggregates by key, user, and
 team. The `x-litellm-response-cost` header is forwarded on every response so
 clients can see per-request cost without hitting the UI.
+
+### `leanProxy` — latency vs full logging
+
+By default (`leanProxy: false`) every request is fully logged: the complete
+prompt text and response are written to the `LiteLLMSpendLogs` table so the
+admin UI shows the full request history.
+
+For long-context responses this adds measurable overhead:
+
+| LiteLLM behaviour | default | `leanProxy: true` |
+|---|---|---|
+| `store_prompts_in_spend_logs` | `true` — full text stored | `false` — text omitted |
+| `disable_streaming_logging` | `false` — per-chunk handlers run | `true` — handlers skipped |
+| Token counts + cost tracking | ✅ | ✅ |
+| Admin UI works | ✅ | ✅ |
+| Prompt history in UI | ✅ | ❌ |
+
+`proxy_batch_write_at: 60` (flush DB every 60 s instead of 10 s) is always
+applied when `adminUi: true` — no data loss, just less frequent flushing.
+
+To enable lean mode, add `"leanProxy": true` to your `config.jsonc`:
+
+```jsonc
+{
+  "adminUi": true,
+  "leanProxy": true
+}
+```
+
+Has no effect when `adminUi: false` — that mode is always fully lean
+(`disable_spend_logs: true` + `disable_streaming_logging: true`).
 
 ### PostgreSQL options
 

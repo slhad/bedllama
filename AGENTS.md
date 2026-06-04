@@ -65,6 +65,40 @@ Run `bedllama legend` for the full reference. Quick summary:
 
 ---
 
+## Running & restarting bedllama
+
+If the systemd user service is installed (`~/.config/systemd/user/bedllama.service`),
+**always use `systemctl` to start, stop, or restart bedllama** — do not run
+`bedllama serve` or `bedllama start` directly. A stray manual process will hold
+port 4000 and cause the service to crash with `EADDRINUSE`.
+
+```bash
+# Check whether the service is installed
+systemctl --user status bedllama
+
+# Preferred: restart via systemctl
+systemctl --user restart bedllama
+
+# Start / stop
+systemctl --user start bedllama
+systemctl --user stop bedllama
+
+# Follow logs
+journalctl --user -fu bedllama
+```
+
+If port 4000 is already in use by a stray process, kill it first:
+```bash
+lsof -i :4000          # find the PID
+kill <pid>             # kill the stray process
+systemctl --user start bedllama
+```
+
+Only use `bedllama serve` / `bedllama start` directly when the systemd service
+is **not** installed.
+
+---
+
 ## Development
 
 ```bash
